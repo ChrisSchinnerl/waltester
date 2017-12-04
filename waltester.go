@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
@@ -31,38 +30,17 @@ func main() {
 	numSilos := int64(250)
 	numIncrease := 20
 
-	// Create new fake database file or open it
-	dbFile, err := os.OpenFile(dbPath, os.O_RDWR|os.O_CREATE, 0777)
-	if err != nil {
-		panic(err)
-	}
-
-	// Create/Recover WAL
-	updates, wal, err := writeaheadlog.New(walPath)
-	if err != nil {
-		panic(err)
-	}
-
 	// Create silo objects
-	var siloOff int64
-	var siloOffsets []int64
-	var silos = make(map[int64]*silo)
-	for i := 0; int64(i) < numSilos; i++ {
-		silo := newSilo(siloOff, 1+i*numIncrease, dbFile)
-		siloOffsets = append(siloOffsets, siloOff)
-		silos[siloOff] = silo
-		siloOff += int64(len(silo.numbers)*4) + checksumSize
+	recoveredTxns, silos, wal, file, err := newSiloDatabase(dbPath, walPath, testdir, numSilos, numIncrease)
+	if err != nil {
+		panic(err)
 	}
 
 	// Start silo updates if the wal didn't exist
-	if len(updates) == 0 {
-		for k := range silos {
-			if err := silos[k].init(); err != nil {
-				panic(fmt.Sprintf("Failed to init silo: %v", err))
-			}
-
+	if len(recoveredTxns) == 0 {
+		for _, silo := range silos {
 			wg.Add(1)
-			go silos[k].threadedUpdate(wal, testdir, &wg)
+			go silo.threadedUpdate(wal, testdir, &wg)
 		}
 
 		// Signal that PC can be unplugged now
@@ -77,7 +55,7 @@ func main() {
 
 	// WAL exists. Start recovery
 	log.Print("len(updates)>0: Starting recovery. Feel free to UNPLUG again")
-	err = recoverSiloWAL(walPath, silos, testdir, dbFile, numSilos, numIncrease)
+	_, err = recoverSiloWAL(walPath, silos, testdir, file, numSilos, numIncrease)
 	if err != nil {
 		log.Printf("Recovery failed: %v", err)
 		return
@@ -93,7 +71,9 @@ const (
 type (
 	// A checksum is a 128-bit blake2b hash.
 	checksum [checksumSize]byte
+)
 
+type (
 	// A silo is a simulated group of data that requires using the full
 	// featureset of the wal for maximum performance. The silo is a list of
 	// numbers followed by a checksum. The numbers form a ring (the first
@@ -107,14 +87,18 @@ type (
 	// should also be exactly one external file per file and not more if the
 	// full database is intact and has been consistently managed.
 	silo struct {
-		// List of numbers in silo and the inbox of the next number that will
+		// List of numbers in silo and the index of the next number that will
 		// be incremented.
 		nextNumber uint32
 		numbers    []uint32
 
+		// The checksum of last written data file
+		cs checksum
+
 		// Utilities
 		f      *os.File // database file holding silo
 		offset int64    // offset within database
+		skip   bool     // skips the next startup and verification of the silo
 	}
 
 	// A siloUpdate contains an update to the silo. There is a number that
@@ -122,28 +106,44 @@ type (
 	// an update to the checksum because the blob file associated with the silo
 	// has changed.
 	siloUpdate struct {
-		offset int64  // L ocation in the file where we need to write a number.
+		offset int64  // Location in the file where we need to write a number.
 		number uint32 // The number we need to write.
 		silo   int64  // Offset of the silo within the file.
 
+		// Datafile checksum management.
 		prevChecksum   checksum // Need to remove the corresponding file.
 		newChecksum    checksum // Need to write the new checksum. File already exists.
-		checksumOffset int64    // Location to write the checksum
+		checksumOffset int64    // Location to write the checksum.
 	}
 )
 
 // newSilo creates a new silo of a certain length at a specific offset in the
 // file
-func newSilo(offset int64, length int, f *os.File) *silo {
+func newSilo(offset int64, length int, f *os.File, dataPath string) (*silo, error) {
 	if length == 0 {
 		panic("numbers shouldn't be empty")
 	}
 
-	return &silo{
+	s := &silo{
 		offset:  offset,
 		numbers: make([]uint32, length, length),
 		f:       f,
 	}
+
+	randomData := fastrand.Bytes(10 * pageSize)
+	s.cs = computeChecksum(randomData)
+
+	// Write initial checksum
+	_, err := s.f.WriteAt(s.cs[:], s.offset+int64(len(s.numbers)*4))
+	if err != nil {
+		return nil, err
+	}
+
+	// Do initial setup write
+	done := make(chan error)
+	go s.threadedSetupWrite(done, dataPath, randomData, s.cs)
+
+	return s, <-done
 }
 
 // marshal marshals a siloUpdate
@@ -176,68 +176,70 @@ func (su *siloUpdate) unmarshal(data []byte) {
 func (su *siloUpdate) newUpdate() writeaheadlog.Update {
 	update := writeaheadlog.Update{
 		Name:         "This is my update. There are others like it but this one is mine",
-		Version:      "v0.9.8.7.6.5.4.3.2.1.a.b.c.d.e.f.g.h.i.j.k.l.m.n.o.p.q.r.s.t.u.v.w.x.y.z",
 		Instructions: su.marshal(),
 	}
 	return update
 }
 
 // newSiloUpdate creates a new Silo update for a number at a specific index
-func (s *silo) newSiloUpdate(index uint32, number uint32, ocs checksum) *siloUpdate {
+func (s *silo) newSiloUpdate(index uint32, number uint32, pcs checksum) *siloUpdate {
 	return &siloUpdate{
 		number:         number,
 		offset:         s.offset + int64(4*(index)),
 		silo:           s.offset,
-		prevChecksum:   ocs,
+		prevChecksum:   pcs,
 		checksumOffset: s.offset + int64(len(s.numbers)*4),
 	}
 }
 
-// checksum calculates the silos's current checksum
-func (s *silo) checksum() (cs checksum) {
-	buf := make([]byte, 4*len(s.numbers))
-	for i := 0; i < len(s.numbers); i++ {
-		binary.LittleEndian.PutUint32(buf[i*4:i*4+4], s.numbers[i])
-	}
-	c := blake2b.Sum256(buf)
+// checksum calculates the silos's current checksum given some data
+func computeChecksum(d []byte) (cs checksum) {
+	c := blake2b.Sum256(d)
 	copy(cs[:], c[:])
 	return
 }
 
 // applyUpdate applies an update to a silo on disk
-func (su siloUpdate) applyUpdate(f *os.File, dataPath string) error {
+func (su siloUpdate) applyUpdate(silo *silo, dataPath string) error {
+	if silo == nil {
+		panic("silo shouldn't be nil")
+	}
+
+	// This update should be skipped this time
+	if silo.skip {
+		return nil
+	}
+
 	// Write number
 	data := make([]byte, 4)
 	binary.LittleEndian.PutUint32(data[:], su.number)
-	_, err := f.WriteAt(data[:], su.offset)
+	_, err := silo.f.WriteAt(data[:], su.offset)
 	if err != nil {
 		return err
 	}
 
 	// Write new checksum
-	_, err = f.WriteAt(su.newChecksum[:], su.checksumOffset)
+	_, err = silo.f.WriteAt(su.newChecksum[:], su.checksumOffset)
 	if err != nil {
 		return err
 	}
 
-	// Delete old data file if it still exists
-	err = os.Remove(filepath.Join(dataPath, hex.EncodeToString(su.prevChecksum[:])))
-	if err != nil && !os.IsNotExist(err) {
-		return err
+	// If a new datafile was created we can delete the old one
+	if bytes.Compare(su.prevChecksum[:], su.newChecksum[:]) != 0 {
+		err = os.Remove(filepath.Join(dataPath, hex.EncodeToString(su.prevChecksum[:])))
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
 	}
-	return nil
-}
 
-// init calculates the checksum of the silo and writes it to disk
-func (s *silo) init() error {
-	cs := s.checksum()
-	_, err := s.f.WriteAt(cs[:], s.offset+int64(len(s.numbers)*4))
-	return err
+	// Update the silos cs field
+	silo.cs = su.newChecksum
+	return nil
 }
 
 // threadedSetupWrite simulates a setup by updating the checksum and writing
 // random data to a file which uses the checksum as a filename
-func (s *silo) threadedSetupWrite(done chan error, dataPath string, ncs checksum) {
+func (s *silo) threadedSetupWrite(done chan error, dataPath string, randomData []byte, ncs checksum) {
 	// signal completion
 	defer close(done)
 
@@ -247,7 +249,7 @@ func (s *silo) threadedSetupWrite(done chan error, dataPath string, ncs checksum
 		done <- err
 		return
 	}
-	_, err = newFile.Write(fastrand.Bytes(10 * pageSize))
+	_, err = newFile.Write(randomData)
 	if err != nil {
 		done <- err
 		return
@@ -266,17 +268,32 @@ func (s *silo) threadedSetupWrite(done chan error, dataPath string, ncs checksum
 func (s *silo) threadedUpdate(w *writeaheadlog.WAL, dataPath string, wg *sync.WaitGroup) {
 	defer wg.Done()
 
+	// This silo has unfinished transactions. Skip it.
+	if s.skip {
+		return
+	}
+
 	// Allocate some memory for the updates
 	sus := make([]*siloUpdate, 0, len(s.numbers))
+
+	// Create some random data and the corresponding checksum for creating data
+	// files
+	randomData := fastrand.Bytes(10 * pageSize)
+	ncs := computeChecksum(randomData)
+
+	// Make sure we start at the beginning of the numbers slice. We need this
+	// since there is a chance that nextNumber gets increased without updates
+	// being applied. This means that we miss a couple of numbers and we might
+	// end up with a slice like [1,2,3,0,0,0,1,2,3,4,5,0,0,0] which is
+	// corrupted.
+	s.nextNumber = 0
 
 	// This thread will execute until the dependency of the silo causes a file
 	// sync to fail
 	for {
 		// Change between 1 and len(s.numbers)
 		length := fastrand.Intn(len(s.numbers)) + 1
-		ocs := s.checksum()
 		appendFrom := length
-		var ncs checksum
 		for j := 0; j < length; j++ {
 			if appendFrom == length && j > 0 && fastrand.Intn(500) == 0 {
 				// There is a 0.5% chance that the remaing updates will be
@@ -288,26 +305,33 @@ func (s *silo) threadedUpdate(w *writeaheadlog.WAL, dataPath string, wg *sync.Wa
 			} else {
 				s.numbers[s.nextNumber] = (s.numbers[s.nextNumber-1] + 1)
 			}
-			ncs = s.checksum()
 
 			// Create siloUpdate
-			su := s.newSiloUpdate(s.nextNumber, s.numbers[s.nextNumber], ocs)
+			su := s.newSiloUpdate(s.nextNumber, s.numbers[s.nextNumber], s.cs)
 			sus = append(sus, su)
 
 			// Increment the index. If that means we reach the end, set it to 0
 			s.nextNumber = (s.nextNumber + 1) % uint32(len(s.numbers))
 		}
 
-		// Set the siloUpdates checksum and create the corresponding update
-		updates := make([]writeaheadlog.Update, 0, len(s.numbers))
-		for _, su := range sus {
-			copy(su.newChecksum[:], ncs[:])
-			updates = append(updates, su.newUpdate())
+		// 10% chance to write new data file
+		newFile := false
+		if fastrand.Intn(10) == 0 {
+			newFile = true
 		}
 
-		// Start setup write
-		wait := make(chan error)
-		go s.threadedSetupWrite(wait, dataPath, ncs)
+		// Set the siloUpdates checksum correctly and create the corresponding
+		// update
+		updates := make([]writeaheadlog.Update, 0, len(s.numbers))
+		for _, su := range sus {
+			// If we create a new file we need to set the checksum accordingly
+			if newFile {
+				copy(su.newChecksum[:], ncs[:])
+			} else {
+				su.newChecksum = su.prevChecksum
+			}
+			updates = append(updates, su.newUpdate())
+		}
 
 		// Create txn
 		txn, err := w.NewTransaction(updates[:appendFrom])
@@ -315,37 +339,51 @@ func (s *silo) threadedUpdate(w *writeaheadlog.WAL, dataPath string, wg *sync.Wa
 			panic(err)
 		}
 
+		// Create new file during setup write if necessary
+		wait := make(chan error)
+		if newFile {
+			go s.threadedSetupWrite(wait, dataPath, randomData, ncs)
+		} else {
+			close(wait)
+		}
+
 		// Append the remaining updates
 		if err := <-txn.Append(updates[appendFrom:]); err != nil {
-			panic(err)
+			return
 		}
 
 		// Wait for setup to finish. If it wasn't successful there is no need
 		// to continue
 		if err := <-wait; err != nil {
-			panic(err)
+			return
 		}
 
 		// Signal setup complete
 		if err := <-txn.SignalSetupComplete(); err != nil {
-			panic(err)
+			return
+		}
+
+		// Reset random data and checksum if we used it
+		if newFile {
+			randomData = fastrand.Bytes(10 * pageSize)
+			ncs = computeChecksum(randomData)
 		}
 
 		// Apply the updates
 		for _, su := range sus {
-			if err := su.applyUpdate(s.f, dataPath); err != nil {
+			if err := su.applyUpdate(s, dataPath); err != nil {
 				panic(err)
 			}
 		}
 
 		// Sync the updates
 		if err := s.f.Sync(); err != nil {
-			panic(err)
+			return
 		}
 
 		// Signal release complete
 		if err := txn.SignalUpdatesApplied(); err != nil {
-			panic(err)
+			return
 		}
 
 		// Reset
@@ -354,80 +392,156 @@ func (s *silo) threadedUpdate(w *writeaheadlog.WAL, dataPath string, wg *sync.Wa
 	}
 }
 
+// toUint32Slice is a helper function to convert a byte slice to a uint32
+// slice
+func toUint32Slice(d []byte) []uint32 {
+	buf := bytes.NewBuffer(d)
+	converted := make([]uint32, len(d)/4, len(d)/4)
+	for i := 0; i < len(converted); i++ {
+		converted[i] = binary.LittleEndian.Uint32(buf.Next(4))
+	}
+	return converted
+}
+
+// verifyNumbers checks the numbers of a silo for corruption
+func verifyNumbers(numbers []uint32) error {
+	// Handle corner cases
+	if len(numbers) == 0 {
+		return errors.New("len of numbers is 0")
+	}
+	if len(numbers) == 1 {
+		return nil
+	}
+
+	// Count the number of dips. Shouldn't be greater than 1
+	dips := 0
+	for i := 1; i < len(numbers); i++ {
+		if numbers[i] < numbers[i-1] {
+			dips++
+		}
+	}
+	// Check for the dip from the last number to the first number.
+	if numbers[0] < numbers[len(numbers)-1] {
+		dips++
+	}
+	if dips > 1 {
+		return fmt.Errorf("numbers are corrupted %v", numbers)
+	}
+	return nil
+}
+
 // recoverSiloWAL recovers the WAL after a crash. This will be called
 // repeatedly until it finishes.
-func recoverSiloWAL(walPath string, silos map[int64]*silo, testdir string, dbFile *os.File, numSilos int64, numIncrease int) (err error) {
+func recoverSiloWAL(walPath string, silos map[int64]*silo, testdir string, file *os.File, numSilos int64, numIncrease int) (numSkipped int64, err error) {
 	// Reload wal.
-	updates, wal, err := writeaheadlog.New(walPath)
+	recoveredTxns, wal, err := writeaheadlog.New(walPath)
 	if err != nil {
-		return errors.Extend(errors.New("failed to reload WAL"), err)
+		return 0, errors.Extend(errors.New("failed to reload WAL"), err)
 	}
 
 	// Unmarshal updates and apply them
-	var checksums = make(map[string]struct{})
-	for _, update := range updates {
-		var su siloUpdate
-		su.unmarshal(update.Instructions)
-		if err := su.applyUpdate(dbFile, testdir); err != nil {
-			return errors.Extend(errors.New("Failed to apply update"), err)
+	var appliedTxns []*writeaheadlog.Transaction
+	for _, txn := range recoveredTxns {
+		// 20% chance to skip transaction
+		skipTxn := fastrand.Intn(5) == 0
+		for _, update := range txn.Updates {
+			var su siloUpdate
+			su.unmarshal(update.Instructions)
+			silos[su.silo].skip = skipTxn
+			if err := su.applyUpdate(silos[su.silo], testdir); err != nil {
+				return 0, errors.Extend(errors.New("Failed to apply update"), err)
+			}
 		}
-		// Remember new checksums to be able to remove unnecessary setup files
-		// later
-		checksums[hex.EncodeToString(su.newChecksum[:])] = struct{}{}
+		if !skipTxn {
+			appliedTxns = append(appliedTxns, txn)
+		}
 	}
 
 	// Sync the applied updates
-	if err := dbFile.Sync(); err != nil {
-		return errors.Extend(errors.New("Failed to sync database"), err)
+	if err := file.Sync(); err != nil {
+		return 0, errors.Extend(errors.New("Failed to sync database"), err)
 	}
 
-	// Remove unnecessary setup files
-	files, err := ioutil.ReadDir(testdir)
-	if err != nil {
-		return errors.Extend(errors.New("Failed to get list of files in testdir"), err)
-	}
-	for _, f := range files {
-		_, exists := checksums[f.Name()]
-		if len(f.Name()) == 32 && !exists {
-			if err := os.Remove(filepath.Join(testdir, f.Name())); err != nil && !os.IsNotExist(err) {
-
-				return errors.Extend(errors.New("Failed to remove setup file"), err)
-			}
-		}
-	}
-
-	// Check if the checksums match the data
+	// Check numbers and checksums
 	numbers := make([]byte, numSilos*int64(numIncrease)*4)
 	var cs checksum
 	for _, silo := range silos {
+		// We didn't apply the changes for this silo. Skip it this time.
+		if silo.skip {
+			continue
+		}
 		// Adjust the size of numbers
 		numbers = numbers[:4*len(silo.numbers)]
 
 		// Read numbers and checksum
 		if _, err := silo.f.ReadAt(numbers, silo.offset); err != nil {
-			return errors.Extend(errors.New("Failed to read numbers of silo"), err)
+			return 0, errors.Extend(errors.New("Failed to read numbers of silo"), err)
 		}
 		if _, err := silo.f.ReadAt(cs[:], silo.offset+int64(4*len(silo.numbers))); err != nil {
-			return errors.Extend(errors.New("Failed to read checksum of silo"), err)
+			return 0, errors.Extend(errors.New("Failed to read checksum of silo"), err)
 		}
 
-		// The checksum should match
-		c := blake2b.Sum256(numbers)
-		if bytes.Compare(c[:checksumSize], cs[:]) != 0 {
-			log.Printf("read cs: %v", cs[:checksumSize])
-			log.Printf("calc cs: %v", c[:checksumSize])
-			log.Printf("read num: %v", numbers)
-			return errors.New("Checksums don't match")
+		// Check numbers for corruption
+		parsedNumbers := toUint32Slice(numbers)
+		if err := verifyNumbers(parsedNumbers); err != nil {
+			return 0, err
 		}
+
+		// Check if a file for the checksum exists
+		csHex := hex.EncodeToString(cs[:])
+		if _, err := os.Stat(filepath.Join(testdir, csHex)); os.IsNotExist(err) {
+			return 0, fmt.Errorf("No file for the following checksum exists: %v", csHex)
+		}
+
+		// Reset silo numbers in memory
+		silo.numbers = parsedNumbers
 	}
 
-	if err := wal.RecoveryComplete(); err != nil {
-		return errors.Extend(errors.New("Failed to signal completed recovery"), err)
+	for _, txn := range appliedTxns {
+		if err := txn.SignalUpdatesApplied(); err != nil {
+			return 0, errors.Extend(errors.New("Failed to signal applied updates"), err)
+		}
 	}
 
 	// Close the wal
-	if err := wal.Close(); err != nil {
-		return errors.Extend(errors.New("Failed to close WAL"), err)
+	var openTxns int64
+	if openTxns, err = wal.CloseIncomplete(); err != nil {
+		return 0, errors.Extend(errors.New("Failed to close WAL"), err)
 	}
-	return nil
+
+	// Sanity check open transactions
+	if int64(len(recoveredTxns)-len(appliedTxns)) != openTxns {
+		panic("Number of skipped txns doesn't match number of open txns")
+	}
+	return openTxns, nil
+}
+
+// newSiloDatabase will create a silo database that overwrites any existing
+// silo database.
+func newSiloDatabase(dbPath, walPath string, dataPath string, numSilos int64, numIncrease int) ([]*writeaheadlog.Transaction, map[int64]*silo, *writeaheadlog.WAL, *os.File, error) {
+	// Create the database file.
+	file, err := os.Create(dbPath)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	// Create the wal.
+	recoveredTxns, wal, err := writeaheadlog.New(walPath)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	// Create and initialize the silos.
+	var siloOffset int64
+	var siloOffsets []int64
+	var silos = make(map[int64]*silo)
+	for i := 0; int64(i) < numSilos; i++ {
+		silo, err := newSilo(siloOffset, 1+i*numIncrease, file, dataPath)
+		if err != nil {
+			return nil, nil, nil, nil, errors.Extend(errors.New("failed to init silo"), err)
+		}
+		siloOffsets = append(siloOffsets, siloOffset)
+		silos[siloOffset] = silo
+		siloOffset += int64(len(silo.numbers)*4) + checksumSize
+	}
+	return recoveredTxns, silos, wal, file, nil
 }
